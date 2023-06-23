@@ -66,6 +66,14 @@ struct BufferStreamDescriptor {
   uint8_t* buf;
   uint64_t cursor;
   uint64_t length;
+  bool error{false};
+};
+
+struct ConstBufferStreamDescriptor {
+  const uint8_t* buf;
+  uint64_t cursor;
+  uint64_t length;
+  bool error{false};
 };
 
 void ensure_stream_length(BufferStreamDescriptor& stream, size_t length) {
@@ -83,11 +91,14 @@ void write_field(BufferStreamDescriptor& buffer, const T& field) {
   // TODO: check bounds (buffer->length)?
 }
 
-template <typename T>
-void read_field(BufferStreamDescriptor& buffer, T& field) {
+template <typename B, typename T>
+void read_field(B& buffer, T& field) {
+  if (buffer.cursor + sizeof(T) > buffer.length) {
+    buffer.error = true;
+    return;
+  }
   std::memcpy(&field, buffer.buf + buffer.cursor, sizeof(T));
   buffer.cursor += sizeof(T);
-  // TODO: check bounds (buffer->length)?
 }
 
 void stream_into(BufferStreamDescriptor& dest, BufferStreamDescriptor& src,
@@ -106,6 +117,37 @@ void stream_from(BufferStreamDescriptor& dest,
   dest.cursor += length;
 }
 
+bool stream_from_const(BufferStreamDescriptor& dest,
+                       const ConstBufferStreamDescriptor& src,
+                       size_t src_cursor, size_t length) {
+  if ((dest.cursor + length) > dest.length) {
+    dest.error = true;
+    return false;
+  }
+  if ((src.cursor + length) > src.length) {
+    return false;
+  }
+  std::memcpy(dest.buf + dest.cursor, src.buf + src_cursor, length);
+  dest.cursor += length;
+  return true;
+}
+
+bool stream_into_const(BufferStreamDescriptor& dest,
+                       ConstBufferStreamDescriptor& src, size_t length) {
+  if ((dest.cursor + length) > dest.length) {
+    dest.error = true;
+    return false;
+  }
+  if ((src.cursor + length) > src.length) {
+    src.error = true;
+    return false;
+  }
+  std::memcpy(dest.buf + dest.cursor, src.buf + src.cursor, length);
+  dest.cursor += length;
+  src.cursor += length;
+  return true;
+}
+
 void write_concat_buffer(BufferStreamDescriptor& dest,
                          const BufferStreamDescriptor& src) {
   ensure_stream_length(dest, dest.cursor + src.cursor + 1);
@@ -113,21 +155,29 @@ void write_concat_buffer(BufferStreamDescriptor& dest,
   dest.cursor += src.cursor;
 }
 
-uint64_t read_varint(BufferStreamDescriptor& buffer) {
+template <typename B>
+uint64_t read_varint(B& buffer) {
   VarIntPart vi;
   uint64_t val = 0;
   uint8_t offset = 0;
   do {
     read_field(buffer, vi);
+    if (buffer.error) {
+      return 0;
+    }
     val |= vi.subint << offset;
     offset += VarIntPart::lenbits;
   } while (vi.more);
   return val;
 }
 
-void read_unit(BufferStreamDescriptor& buffer, DeltaUnitMem& unit) {
+template <typename B>
+void read_unit(B& buffer, DeltaUnitMem& unit) {
   DeltaHeadUnit head;
   read_field(buffer, head);
+  if (buffer.error) {
+    return;
+  }
 
   unit.flag = head.flag;
   unit.length = head.length;
@@ -137,10 +187,6 @@ void read_unit(BufferStreamDescriptor& buffer, DeltaUnitMem& unit) {
   if (head.flag) {
     unit.offset = read_varint(buffer);
   }
-#if DEBUG_UNITS
-  fprintf(stderr, "Reading unit %d %zu %zu\n", unit.flag, unit.length,
-          unit.offset);
-#endif
 }
 
 static constexpr uint8_t varint_mask = ((1 << VarIntPart::lenbits) - 1);
@@ -523,5 +569,50 @@ int gdecode(uint8_t* deltaBuf, uint32_t deltaSize, uint8_t* baseBuf,
 
   *outSize = outStream.cursor;
   *outBuf = outStream.buf;
+  return outStream.cursor;
+}
+
+int gdecode2(const uint8_t* deltaBuf, const uint32_t deltaSize,
+             const uint8_t* baseBuf, const uint32_t baseSize, uint8_t* outBuf,
+             const uint32_t outSize) {
+  if (outBuf == nullptr) {
+    return -1;
+  }
+  if (outSize == 0) {
+    return 0;
+  }
+
+  // Data in
+  ConstBufferStreamDescriptor baseStream = {baseBuf, 0, baseSize};
+  // Instructions
+  ConstBufferStreamDescriptor deltaStream = {deltaBuf, 0, deltaSize};
+  // Data out
+  BufferStreamDescriptor outStream = {outBuf, 0, outSize};
+  const uint64_t instructionLength = read_varint(deltaStream);
+  const uint64_t instOffset = deltaStream.cursor;
+  ConstBufferStreamDescriptor addDeltaStream = {
+      deltaBuf, deltaStream.cursor + instructionLength, deltaSize};
+  DeltaUnitMem unit = {};
+
+  while (deltaStream.cursor < instructionLength + instOffset) {
+    read_unit(deltaStream, unit);
+    if (deltaStream.error) {
+      return -2;
+    }
+    if (unit.flag) {  // Read from original file using offset
+      if (!stream_from_const(outStream, baseStream, unit.offset, unit.length)) {
+        return baseStream.error ? -2 : -1;
+      }
+    } else {
+      // Read from delta file at current cursor
+      if (!stream_into_const(outStream, addDeltaStream, unit.length)) {
+        return addDeltaStream.error ? -2 : -1;
+      }
+    }
+    if (outStream.error) {
+      return -1;
+    }
+  }
+
   return outStream.cursor;
 }
